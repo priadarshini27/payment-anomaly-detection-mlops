@@ -1,0 +1,27 @@
+# Dataset
+data/*.csv
+data/*.zip
+data/*.parquet
+data/*.db
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# SQLite
+*.sqlite
+*.db
+
+# Models
+models/*.pkl
+models/*.joblib
+
+# Logs
+logs/
+
+# Streamlit cache
+.streamlit/
