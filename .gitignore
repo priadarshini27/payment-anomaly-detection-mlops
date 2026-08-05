@@ -17,11 +17,13 @@ __pycache__/
 *.db
 
 # Models
-models/*.pkl
-models/*.joblib
+models/artifacts/
 
 # Logs
 logs/
 
 # Streamlit cache
 .streamlit/
+
+# Old docs (superseded by docs/)
+doc/
