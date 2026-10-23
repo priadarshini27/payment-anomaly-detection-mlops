@@ -47,6 +47,43 @@ before fitting, since Isolation Forest's random split thresholds are
 sensitive to feature scale (an unscaled `amount`-derived feature spanning
 orders of magnitude would dominate splits over a 0/1 one-hot column).
 
+## Train/test split
+
+The model is fit only on the **earliest 80% of rows by `step`**. Every
+later row is held out: the scaler, the forest and the drift reference
+window never see it, so [07-evaluation-metrics.md](07-evaluation-metrics.md)
+can measure how the model performs on transactions from *after* its
+training period, rather than on data it was fitted to.
+
+| Partition | Steps | Rows | Fraud | Base fraud rate |
+|---|---|---|---|---|
+| Training | 1–355 | 5,113,881 | 3,960 | 0.077% |
+| Held-out | 356–743 | 1,248,723 | 4,237 | 0.339% |
+
+Design decisions:
+
+- **Split by time, not at random.** A deployed model only ever scores
+  transactions that happen after it was trained. A random split would mix
+  later behaviour into training, and because `txnVelocity1h/24h` are built
+  from each account's history, it would also put rows that share history
+  on both sides of the split.
+- **Split on whole steps.** `train_step_end_for_fraction()` picks the first
+  step at which the cumulative row count reaches 80%, so each simulated
+  hour lands entirely on one side. It always leaves at least one step held
+  out.
+- **Split by row count, not step count.** PaySim's volume collapses after
+  roughly step 400 while fraud keeps arriving at a steady pace, so 80% of
+  *rows* is reached at step 355 (less than half the 743 steps). The held-out
+  window therefore has a much higher fraud rate. That doesn't hurt the
+  evaluation, but it does mean raw PR-AUC can't be compared across the two
+  windows (see [07-evaluation-metrics.md](07-evaluation-metrics.md)).
+- **The cutoff is recorded.** `model_runs.train_step_end` stores the last
+  training step for every run, so `models/evaluate.py` always knows which
+  rows are held out for a given model. Databases created before this column
+  existed get it added automatically by `ensure_split_columns()`.
+
+The fraction can be changed with `--train-fraction` (default `0.8`).
+
 ## `models/train.py`
 
 ### File: models/train.py
@@ -74,11 +111,21 @@ Hyperparameters (Document 1, Table 2):
                             features is unnecessary.
   random_state=42        -- fixed for reproducibility across train/eval/retrain.
 
+Train/test split:
+  The model is fit only on the earliest TRAIN_FRACTION (80%) of rows by
+  `step` (time order). Everything after `train_step_end` is held out and
+  never touches the scaler, the model, or the drift reference window, so
+  models/evaluate.py can measure out-of-time generalization rather than
+  in-sample fit. A time split (not a random one) is used because a
+  deployed model only ever scores transactions from after its training
+  window, and a random split would leak future behaviour into training.
+
 Run directly:
     python models/train.py
-Reads the full `transactions` table from database/database.db (which must
-already have txnVelocity1h/24h backfilled by sql/queries.py), fits the
-model, and writes artifacts to models/artifacts/.
+Reads the training partition of the `transactions` table from
+database/database.db (which must already have txnVelocity1h/24h backfilled
+by sql/queries.py), fits the model, and writes artifacts to
+models/artifacts/.
 """
 
 from __future__ import annotations
@@ -102,6 +149,8 @@ from sql.queries import get_engine  # noqa: E402
 
 ARTIFACTS_DIR = Path("models/artifacts")
 
+TRAIN_FRACTION = 0.8  # earliest 80% of rows (by step) are used for training
+
 HYPERPARAMS = dict(
     n_estimators=200,
     contamination=0.0013,
@@ -111,7 +160,46 @@ HYPERPARAMS = dict(
 )
 
 
-def load_training_data(engine, fetch_batch_size: int = 200_000) -> pd.DataFrame:
+def train_step_end_for_fraction(step_counts: pd.DataFrame, train_fraction: float = TRAIN_FRACTION) -> int:
+    """
+    Returns the last `step` of the training partition: the smallest step at
+    which the cumulative row count reaches train_fraction of all rows.
+    step_counts has columns [step, n] (one row per distinct step).
+    Splitting on whole steps keeps every hour entirely on one side.
+    """
+    if not 0 < train_fraction < 1:
+        raise ValueError(f"train_fraction must be in (0, 1), got {train_fraction}")
+    if len(step_counts) < 2:
+        raise ValueError("Need at least two distinct steps to make a train/test split.")
+    counts = step_counts.sort_values("step")
+    cum_frac = counts["n"].cumsum() / counts["n"].sum()
+    idx = int(np.searchsorted(cum_frac.to_numpy(), train_fraction))
+    idx = min(idx, len(counts) - 2)  # always leave at least one step held out
+    return int(counts["step"].iloc[idx])
+
+
+def compute_train_step_end(engine, train_fraction: float = TRAIN_FRACTION) -> int:
+    step_counts = pd.read_sql(
+        text("SELECT step, COUNT(*) AS n FROM transactions GROUP BY step;"), engine
+    )
+    return train_step_end_for_fraction(step_counts, train_fraction)
+
+
+def ensure_split_columns(engine) -> None:
+    """
+    Adds the train/test split columns to model_runs on databases created
+    before they existed in database/schema.sql (CREATE TABLE IF NOT EXISTS
+    won't alter an existing table).
+    """
+    new_cols = {"train_step_end": "INTEGER", "train_pr_auc": "REAL", "train_roc_auc": "REAL"}
+    with engine.begin() as conn:
+        existing = {row[1] for row in conn.execute(text("PRAGMA table_info(model_runs);"))}
+        for col, col_type in new_cols.items():
+            if col not in existing:
+                conn.execute(text(f"ALTER TABLE model_runs ADD COLUMN {col} {col_type};"))
+
+
+def load_training_data(engine, max_step: int | None = None, fetch_batch_size: int = 200_000) -> pd.DataFrame:
     """
     Loads every transaction row needed to build the model feature matrix.
 
@@ -126,18 +214,23 @@ def load_training_data(engine, fetch_batch_size: int = 200_000) -> pd.DataFrame:
     on a memory-constrained machine. Streaming in fixed-size batches caps
     the peak extra memory at one batch's worth of Python tuples rather than
     the whole table's.
+
+    max_step restricts the load to the training partition (step <= max_step).
     """
     cols = ["txn_id", "step", "isFraud"] + MODEL_FEATURE_COLUMNS
-    sql = f"SELECT {', '.join(cols)} FROM transactions;"
+    where, params = "", ()
+    if max_step is not None:
+        where, params = " WHERE step <= ?", (int(max_step),)
+    sql = f"SELECT {', '.join(cols)} FROM transactions{where};"
 
     raw_conn = engine.raw_connection()
     try:
         cur = raw_conn.cursor()
-        cur.execute("SELECT COUNT(*) FROM transactions;")
+        cur.execute(f"SELECT COUNT(*) FROM transactions{where};", params)
         n_rows = cur.fetchone()[0]
 
         data = np.empty((n_rows, len(cols)), dtype="float64")
-        cur.execute(sql)
+        cur.execute(sql, params)
         offset = 0
         while True:
             batch = cur.fetchmany(fetch_batch_size)
@@ -174,7 +267,8 @@ def save_artifacts(model, scaler, reference_window: pd.DataFrame, timestamp: str
     }
 
 
-def insert_model_run(engine, timestamp: str, n_rows: int, artifact_paths: dict) -> int:
+def insert_model_run(engine, timestamp: str, n_rows: int, artifact_paths: dict,
+                     train_step_end: int | None = None) -> int:
     with engine.begin() as conn:
         result = conn.execute(
             text(
@@ -182,11 +276,13 @@ def insert_model_run(engine, timestamp: str, n_rows: int, artifact_paths: dict) 
                 INSERT INTO model_runs (
                     trained_at, n_estimators, contamination, max_samples,
                     max_features, random_state, n_training_rows,
-                    model_path, scaler_path, reference_window_path, is_deployed
+                    model_path, scaler_path, reference_window_path,
+                    train_step_end, is_deployed
                 ) VALUES (
                     :trained_at, :n_estimators, :contamination, :max_samples,
                     :max_features, :random_state, :n_training_rows,
-                    :model_path, :scaler_path, :reference_window_path, 0
+                    :model_path, :scaler_path, :reference_window_path,
+                    :train_step_end, 0
                 );
                 """
             ),
@@ -198,6 +294,7 @@ def insert_model_run(engine, timestamp: str, n_rows: int, artifact_paths: dict) 
                 "max_features": HYPERPARAMS["max_features"],
                 "random_state": HYPERPARAMS["random_state"],
                 "n_training_rows": n_rows,
+                "train_step_end": train_step_end,
                 **artifact_paths,
             },
         )
@@ -205,7 +302,8 @@ def insert_model_run(engine, timestamp: str, n_rows: int, artifact_paths: dict) 
     return run_id
 
 
-def train(db_path: str | None = None, reference_sample_size: int = 200_000) -> int:
+def train(db_path: str | None = None, reference_sample_size: int = 200_000,
+          train_fraction: float = TRAIN_FRACTION) -> int:
     """
     Runs the full training routine end-to-end and returns the new run_id.
 
@@ -213,19 +311,27 @@ def train(db_path: str | None = None, reference_sample_size: int = 200_000) -> i
     drift-monitoring reference window (the full training set is used to
     *fit* the model, but only a representative sample needs to be kept on
     disk as the reference distribution for PSI/KS comparisons later).
+
+    train_fraction sets the time-based split: only the earliest
+    train_fraction of rows (by step) are loaded and fitted on; the rest are
+    held out for models/evaluate.py.
     """
     from sql.queries import get_engine as _get_engine, DEFAULT_DB_PATH
 
     engine = _get_engine(db_path) if db_path else _get_engine(DEFAULT_DB_PATH)
 
-    print("Loading training data from SQLite...")
-    df = load_training_data(engine)
-    if df.empty:
-        raise RuntimeError(
-            "No rows found in `transactions`. Run preprocessing/clean_data.py and "
-            "database/load_data.py first."
-        )
-    print(f"Loaded {len(df):,} rows.")
+    ensure_split_columns(engine)
+    with engine.connect() as conn:
+        if conn.execute(text("SELECT COUNT(*) FROM transactions;")).scalar() == 0:
+            raise RuntimeError(
+                "No rows found in `transactions`. Run preprocessing/clean_data.py and "
+                "database/load_data.py first."
+            )
+    train_step_end = compute_train_step_end(engine, train_fraction)
+
+    print(f"Loading training data from SQLite (step <= {train_step_end})...")
+    df = load_training_data(engine, max_step=train_step_end)
+    print(f"Loaded {len(df):,} training rows; steps > {train_step_end} are held out.")
 
     X = build_model_matrix(df)
 
@@ -244,7 +350,7 @@ def train(db_path: str | None = None, reference_sample_size: int = 200_000) -> i
     )[["step"] + MODEL_FEATURE_COLUMNS]
 
     artifact_paths = save_artifacts(model, scaler, reference_window, timestamp)
-    run_id = insert_model_run(engine, timestamp, len(df), artifact_paths)
+    run_id = insert_model_run(engine, timestamp, len(df), artifact_paths, train_step_end)
 
     print(f"Training complete. model_runs.run_id = {run_id}")
     print(f"  model:            {artifact_paths['model_path']}")
@@ -258,8 +364,11 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--db-path", default=None)
     parser.add_argument("--reference-sample-size", type=int, default=200_000)
+    parser.add_argument("--train-fraction", type=float, default=TRAIN_FRACTION,
+                        help="Fraction of rows (earliest by step) used for training; the rest is held out.")
     args = parser.parse_args()
-    train(db_path=args.db_path, reference_sample_size=args.reference_sample_size)
+    train(db_path=args.db_path, reference_sample_size=args.reference_sample_size,
+          train_fraction=args.train_fraction)
 
 
 if __name__ == "__main__":
@@ -442,7 +551,8 @@ if __name__ == "__main__":
 ## Running training
 
 ```bash
-python models/train.py
+python models/train.py                      # default: train on earliest 80% of rows
+python models/train.py --train-fraction 0.7 # hold out more data
 ```
 
 This must run **after** `sql/queries.py` has backfilled the velocity
@@ -451,7 +561,7 @@ every row, and `build_model_matrix()` would silently default them to 0
 (see the fallback logic in `preprocessing/feature_engineering.py`),
 degrading two of the twelve model features to noise.
 
-Training on the full 6.36M engineered rows completes quickly because
+Training on the 5.1M-row training partition completes quickly because
 `max_samples='auto'` caps each of the 200 trees at 256 subsampled rows —
 Isolation Forest's whole design point is that it does not need to see
 every row during a single tree's construction to isolate anomalies
@@ -459,7 +569,23 @@ effectively. The dominant cost is loading and typing the feature matrix,
 not fitting the forest itself — see the note on `load_training_data`
 above.
 
-### Measured result (full 6,362,604-row dataset)
+### Measured result (run 2, time-based split)
+
+```
+Loading training data from SQLite (step <= 355)...
+Loaded 5,113,881 training rows; steps > 355 are held out.
+Fitting IsolationForest (n_estimators=200, contamination=0.0013)...
+Training complete. model_runs.run_id = 2
+  model:            models\artifacts\model_20261017T025742Z.joblib
+  scaler:           models\artifacts\scaler_20261017T025742Z.joblib
+  reference window: models\artifacts\reference_window_20261017T025742Z.csv
+```
+
+### Earlier result (run 1, before the split existed)
+
+Run 1 was fit on every row, so it has no held-out data. It is kept in
+`model_runs` for comparison; `models/evaluate.py` still evaluates it, but
+prints a warning that its metrics are in-sample only.
 
 ```
 Loading training data from SQLite...
@@ -494,7 +620,8 @@ identical `SELECT * FROM transactions` pattern.
 Every call to `train()` inserts a new `model_runs` row and writes three
 new artifacts to `models/artifacts/`, timestamped to the second
 (`model_<UTC timestamp>.joblib`, `scaler_<...>.joblib`,
-`reference_window_<...>.csv`). Nothing is overwritten — every trained
+`reference_window_<...>.csv`), along with the `train_step_end` cutoff
+that defines its held-out window. Nothing is overwritten — every trained
 version is kept, which is what lets
 [06-modeling.md](06-modeling.md)/[07-evaluation-metrics.md](07-evaluation-metrics.md)'s
 model-comparison story and the dashboard's PR-AUC trend chart work

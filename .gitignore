@@ -27,3 +27,6 @@ logs/
 
 # Old docs (superseded by docs/)
 doc/
+
+# Claude residuals
+.claude

@@ -57,12 +57,14 @@ written back:
 1. Load the computed `(txn_id, v1h, v24h)` triples into a **temp table**
    via a single `executemany` **INSERT** — cheap, because an `INSERT`
    has no `WHERE`-clause row lookup, unlike an `UPDATE`.
-2. Apply all 6.36 million values in **one set-based `UPDATE ... FROM`-style
-   join** (a correlated-subquery `UPDATE` against the temp table, which
-   SQLite executes as a single statement rather than millions of
-   round-trips) instead of one `UPDATE` per row.
+2. Apply all 6.36 million values in **one set-based `UPDATE`** with
+   correlated subqueries against the temp table, keyed on its `txn_id`
+   primary key. SQLite executes it as a single statement rather than
+   millions of round-trips, instead of one `UPDATE` per row.
 
-Measured on the full dataset: **4m25s total**, versus 20+ minutes with no
+Measured on the full dataset: **4m19s–4m25s total** across two runs
+(re-running it rewrites identical values, so it is safe to repeat), versus
+20+ minutes with no
 completion for approach 1, and no completion in a comparable window for
 approach 2's write-back. This is the version that ships.
 
@@ -80,17 +82,17 @@ engine so the same functions can be reused from a script, a notebook, or
 the Streamlit dashboard without duplicating connection logic.
 
 Functions:
-  get_engine                       -- creates a SQLAlchemy engine for database.db
-  compute_velocity_dataframe        -- vectorized numpy computation of the velocity windows
-  get_velocity_features              -- computes and bulk-backfills txnVelocity1h/24h
-  get_type_aggregates                 -- volume/value by transaction type
-  get_fraud_breakdown                  -- fraud rate by type / amount band / step
-  get_cohort_balance_consistency        -- balance-residual distribution query
-  get_transaction_overview_timeseries    -- per-step transaction counts/volumes
-  get_model_run_history                   -- model_runs history for trend charts
-  get_drift_summary                        -- drift_metrics for a given run
-  get_latest_deployed_run                   -- most recent model_runs row
-  get_system_health                          -- row counts + last-run timestamps
+  get_engine                          -- creates a SQLAlchemy engine for database.db
+  compute_velocity_dataframe           -- vectorized numpy computation of the velocity windows
+  get_velocity_features                 -- computes and bulk-backfills txnVelocity1h/24h
+  get_type_aggregates                    -- volume/value by transaction type
+  get_fraud_breakdown                     -- fraud rate by type / amount band / step
+  get_cohort_balance_consistency           -- balance-residual distribution query
+  get_transaction_overview_timeseries       -- per-step transaction counts/volumes
+  get_model_run_history                      -- model_runs history for trend charts
+  get_drift_summary                           -- drift_metrics for a given run
+  get_latest_deployed_run                      -- most recent model_runs row
+  get_system_health                             -- row counts + last-run timestamps
 """
 
 from __future__ import annotations
@@ -189,13 +191,10 @@ def get_velocity_features(engine: Engine) -> int:
     compute_velocity_dataframe) but writes the result back as a single
     bulk operation: the computed values are loaded into a temp table via
     one fast executemany INSERT (cheap -- no WHERE-clause row lookup per
-    statement), and then a single correlated-subquery UPDATE against that
-    temp table applies all 6.36M values in one set-based statement instead
-    of millions of round-trips. Measured on the full dataset: 4m25s total.
-
-    For a fresh load, prefer computing velocity in
-    preprocessing/clean_data.py before the initial INSERT instead of
-    calling this function as a post-hoc backfill -- see that module.
+    statement), and then a single UPDATE with correlated subqueries
+    against that temp table (keyed on its txn_id primary key) applies all
+    6.36M values in one set-based statement instead of millions of
+    round-trips. Measured on the full dataset: 4m19s-4m25s total.
 
     Returns the number of rows updated.
     """

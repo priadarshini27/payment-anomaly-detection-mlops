@@ -283,5 +283,23 @@ recover once the write finishes).
 If the database has no transactions yet, the app shows the exact pipeline
 commands needed to populate it, rather than crashing on an empty table.
 
+## Reading the Model Performance trend
+
+The PR-AUC/ROC-AUC trend plots each run's stored `pr_auc`/`roc_auc`, and
+those don't all mean the same thing:
+
+- **Run 1** was trained and evaluated on all rows, so its points are
+  in-sample (PR-AUC 0.0114 on a 0.129% fraud rate).
+- **Run 2 onward** are evaluated on held-out rows only (PR-AUC 0.0280 on a
+  0.339% fraud rate).
+
+The jump in PR-AUC from run 1 to run 2 comes from the higher fraud rate in
+the held-out window, not from a better model; ROC-AUC, which doesn't depend
+on the fraud rate, is flat (0.854 in both). Compare PR-AUC only between
+runs evaluated on the same window. See
+[07-evaluation-metrics.md](07-evaluation-metrics.md#generalization-check-overfitting).
+The view doesn't plot the training-window metrics (`train_pr_auc`,
+`train_roc_auc`); query them from `model_runs` directly.
+
 ---
 [← 08 — Drift Monitoring](08-drift-monitoring.md) | [Index](README.md) | Next: [10 — Testing & Validation →](10-testing-and-validation.md)
