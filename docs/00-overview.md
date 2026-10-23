@@ -103,9 +103,9 @@ self-correcting rather than a one-shot batch job.
 | Feature Engineering | `preprocessing/feature_engineering.py` | Derives balance-delta errors, `origZeroedOut`, `logAmount`, `isMerchantDest`, one-hot `type` |
 | Storage | `database/schema.sql`, `database/load_data.py` | Normalized tables: `transactions`, `model_runs`, `drift_metrics`, `retrain_log`; indexed on `step`, `nameOrig`, `type`, `isFraud` |
 | Analytics | `sql/queries.py` | Parameterized SQL for velocity features, fraud breakdowns, cohort/balance-consistency checks |
-| Modeling | `models/train.py` | Fits `sklearn.IsolationForest`, persists model + scaler via `joblib`, records hyperparameters |
+| Modeling | `models/train.py` | Fits `sklearn.IsolationForest` on the earliest 80% of rows by `step` (time-based split), persists model + scaler via `joblib`, records hyperparameters and the split cutoff |
 | Scoring | `models/predict.py` | Loads a persisted model, scores transactions, writes `anomaly_score` / `is_anomaly` |
-| Evaluation | `models/evaluate.py` | Computes PR-AUC, ROC-AUC, precision@k, recall@k, F1, confusion matrix by type |
+| Evaluation | `models/evaluate.py` | Computes PR-AUC, ROC-AUC, precision@k, recall@k, F1, confusion matrix by type on the held-out rows; compares with the training rows to detect overfitting |
 | Drift | `drift/psi.py`, `drift/ks_test.py`, `drift/retrain.py` | Computes PSI and KS statistics per feature; applies the dual retraining trigger |
 | Dashboard | `dashboard/app.py` | Streamlit app rendering six views backed by live SQLite queries and Plotly charts |
 
@@ -167,6 +167,7 @@ payment-anomaly-detection-mlops/
 │   ├── test_feature_engineering.py
 │   ├── test_clean_data.py
 │   ├── test_drift.py
+│   ├── test_train_split.py
 │   └── __init__.py
 ├── docs/                          # this documentation library
 ├── doc/                            # original Word-document specification

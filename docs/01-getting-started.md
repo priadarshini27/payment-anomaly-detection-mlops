@@ -54,6 +54,7 @@ New-Item tests\__init__.py -ItemType File
 New-Item tests\test_feature_engineering.py -ItemType File
 New-Item tests\test_clean_data.py -ItemType File
 New-Item tests\test_drift.py -ItemType File
+New-Item tests\test_train_split.py -ItemType File
 New-Item pytest.ini -ItemType File
 New-Item requirements.txt -ItemType File
 New-Item README.md -ItemType File
@@ -69,7 +70,7 @@ touch sql/queries.py sql/__init__.py
 touch models/train.py models/predict.py models/evaluate.py models/__init__.py
 touch drift/psi.py drift/ks_test.py drift/retrain.py drift/__init__.py
 touch dashboard/app.py dashboard/__init__.py
-touch tests/__init__.py tests/test_feature_engineering.py tests/test_clean_data.py tests/test_drift.py
+touch tests/__init__.py tests/test_feature_engineering.py tests/test_clean_data.py tests/test_drift.py tests/test_train_split.py
 touch pytest.ini requirements.txt README.md
 ```
 
@@ -162,12 +163,14 @@ python database/load_data.py
 #    (requires a window-function query over the full ordered history).
 python sql/queries.py
 
-# 4. Fit the Isolation Forest on the full feature matrix and persist
-#    model + scaler + reference window artifacts.
+# 4. Fit the Isolation Forest on the earliest 80% of rows (by step) and
+#    persist model + scaler + reference window artifacts. Later rows are
+#    held out for evaluation.
 python models/train.py
 
-# 5. Score every transaction and evaluate against the held-out isFraud
-#    label (PR-AUC, ROC-AUC, precision@k, recall@k, F1, confusion matrix).
+# 5. Evaluate on the held-out rows against isFraud (PR-AUC, ROC-AUC,
+#    precision@k, recall@k, F1, confusion matrix), and compare with the
+#    training rows to check for overfitting.
 python models/evaluate.py
 
 # 6. Run a drift check comparing the training reference window against a
@@ -179,10 +182,15 @@ streamlit run dashboard/app.py
 ```
 
 On the full 6.36M-row dataset, expect step 1 (cleaning) to take roughly
-2.5–3 minutes, step 2 (SQLite load) a similar amount of time, and step 4
-(training) to complete in well under a minute since scikit-learn's
+2.5–3 minutes, step 2 (SQLite load) a similar amount of time, step 4
+(training) about 3 minutes, and step 5 (evaluation) about 6 minutes.
+Fitting the forest itself is fast, because scikit-learn's
 `IsolationForest` subsamples 256 rows per tree by default
-(`max_samples='auto'`) regardless of the full dataset's size.
+(`max_samples='auto'`) regardless of the dataset's size; training time is
+mostly spent loading the feature matrix from SQLite (see
+[06-modeling.md](06-modeling.md)). Evaluation scores every row, both the
+held-out rows and the training rows used for the overfitting check, with
+all 200 trees.
 
 ## Step 5 — Verify
 

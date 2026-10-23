@@ -48,11 +48,23 @@ operationally:
 | `--db-path` | every CLI script | `database/database.db` | Point at a different SQLite file (e.g. for a staging environment) |
 | `--chunksize` | `clean_data.py`, `load_data.py` | 500,000 / 100,000 | Lower this on memory-constrained machines |
 | `HYPERPARAMS` dict | `models/train.py` | see [06-modeling.md](06-modeling.md) | Model hyperparameters — edit in code and re-run to change |
+| `--train-fraction` (`TRAIN_FRACTION`) | `models/train.py` | 0.8 | Share of rows, earliest by `step`, used for training; the rest is held out for evaluation |
 | `K_FRACTION` | `models/evaluate.py` | 0.005 | The "top k%" definition for precision@k/recall@k |
+| `OVERFIT_ROC_AUC_GAP` | `models/evaluate.py` | 0.05 | Training-window minus held-out ROC-AUC above which evaluation warns about overfitting |
 | `N_DRIFTED_FEATURES_TRIGGER`, `PR_AUC_DROP_PCT_TRIGGER` | `drift/retrain.py` | 3, 0.15 | The dual retraining trigger thresholds |
 | `--current-step-start`/`--current-step-end` | `drift/retrain.py` | 600 / 744 | The scoring window compared against the training reference |
 
 ## Production hardening notes
+
+- **Retraining always holds out the newest rows.** `models/train.py`
+  trains on the earliest `TRAIN_FRACTION` of *whatever is in
+  `transactions`*, so when `drift/retrain.py` triggers a retrain, the
+  newest 20% of rows — the period where drift was detected — is used for
+  evaluation, not training. That is the right setup for measuring a
+  model, but it means a retrain adapts to drift only partially. For a
+  production retrain, evaluate with the default split first, then, if
+  the held-out results look healthy, refit on all rows (or on a recent
+  sliding window) before deploying.
 
 - **SQLite concurrency.** SQLite handles concurrent readers well but
   serializes writers. The dashboard only reads; batch jobs (`clean_data.py`,

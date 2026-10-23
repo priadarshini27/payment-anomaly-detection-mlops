@@ -9,7 +9,7 @@ single-digit-millions-of-rows range. Four tables back the full lifecycle:
 | Table | Written by | Purpose |
 |---|---|---|
 | `transactions` | `database/load_data.py`, backfilled by `sql/queries.py` and `models/predict.py` | Cleaned, feature-engineered PaySim transaction log |
-| `model_runs` | `models/train.py` (hyperparameters), `models/evaluate.py` (metrics, UPDATE) | One row per trained Isolation Forest version |
+| `model_runs` | `models/train.py` (hyperparameters, `train_step_end` split cutoff), `models/evaluate.py` (held-out and training-window metrics, UPDATE) | One row per trained Isolation Forest version |
 | `drift_metrics` | `drift/retrain.py` | Per-feature PSI/KS statistics for every drift check |
 | `retrain_log` | `drift/retrain.py` | Audit trail of every retraining decision, triggered or not |
 
@@ -109,20 +109,29 @@ CREATE TABLE IF NOT EXISTS model_runs (
 
     -- Artifact locations
     model_path              TEXT    NOT NULL,
-    scaler_path              TEXT    NOT NULL,
+    scaler_path             TEXT    NOT NULL,
     reference_window_path   TEXT,
 
-    -- Evaluation metrics (filled in by models/evaluate.py)
+    -- Time-based train/test split: rows with step <= train_step_end were
+    -- used for fitting; later rows are the held-out evaluation window.
+    train_step_end          INTEGER,
+
+    -- Evaluation metrics (filled in by models/evaluate.py). These are
+    -- computed on the held-out window (step > train_step_end).
     pr_auc                  REAL,
     roc_auc                 REAL,
     precision_at_k          REAL,
     recall_at_k             REAL,
-    f1_at_threshold          REAL,
+    f1_at_threshold         REAL,
     threshold                REAL,
-    k_fraction                REAL,
+    k_fraction               REAL,
 
-    is_deployed               INTEGER NOT NULL DEFAULT 0,
-    notes                      TEXT
+    -- Same ranking metrics on the training window, for the train/test gap.
+    train_pr_auc             REAL,
+    train_roc_auc            REAL,
+
+    is_deployed              INTEGER NOT NULL DEFAULT 0,
+    notes                    TEXT
 );
 
 -- -----------------------------------------------------------------------------
@@ -147,9 +156,9 @@ CREATE TABLE IF NOT EXISTS drift_metrics (
     current_window_start     INTEGER NOT NULL,   -- step
     current_window_end       INTEGER NOT NULL,   -- step
 
-    computed_at               TEXT    NOT NULL,   -- ISO-8601 timestamp
-    psi_flag                  TEXT    NOT NULL,   -- 'none' | 'moderate' | 'significant'
-    ks_flag                   INTEGER NOT NULL    -- 1 if ks_pvalue < 0.05 else 0
+    computed_at              TEXT    NOT NULL,   -- ISO-8601 timestamp
+    psi_flag                 TEXT    NOT NULL,   -- 'none' | 'moderate' | 'significant'
+    ks_flag                  INTEGER NOT NULL    -- 1 if ks_pvalue < 0.05 else 0
 );
 
 CREATE INDEX IF NOT EXISTS idx_drift_metrics_run_id  ON drift_metrics (run_id);

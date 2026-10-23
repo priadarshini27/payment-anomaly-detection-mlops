@@ -482,42 +482,52 @@ period). Override with `--current-step-start`/`--current-step-end` to
 check a different window, or pass `--no-auto-retrain` to only log the
 decision without actually fitting a new model even if the trigger fires.
 
-### Measured result (full dataset, reference window vs. step 600–744)
+### What the reference window contains
+
+The reference window is a 200,000-row random sample of the model's
+**training partition** only (steps 1–355 for run 2; see
+[06-modeling.md](06-modeling.md#traintest-split)). The default "current"
+window, steps 600–744, lies entirely in the held-out period, so the drift
+check compares the data the model learned from with transactions it has
+never seen, which is the comparison that matters in production.
+
+### Measured result (run 2: reference steps 1–355 vs. steps 600–744)
 
 ```
 ============================================================
 Drift check summary
 ============================================================
     feature_name  psi_value psi_flag  ks_statistic     ks_pvalue  ks_flag
-       logAmount   0.001591     none      0.015353  2.112544e-14        1
-balanceDeltaOrig   0.007892     none      0.035564  2.009220e-75        1
-balanceDeltaDest   0.018375     none      0.031171  4.890014e-58        1
-   origZeroedOut   0.000000     none      0.040988 4.700391e-100        1
-  isMerchantDest   0.000000     none      0.000820  1.000000e+00        0
-    type_CASH_IN   0.000000     none      0.011768  1.228042e-08        1
-   type_CASH_OUT   0.000000     none      0.028802  1.297396e-49        1
-      type_DEBIT   0.000000     none      0.001665  9.913490e-01        0
-    type_PAYMENT   0.000000     none      0.000820  1.000000e+00        0
-   type_TRANSFER   0.000000     none      0.014550  5.608436e-13        1
-   txnVelocity1h   0.000000     none      0.000010  1.000000e+00        0
-  txnVelocity24h   0.000000     none      0.000140  1.000000e+00        0
+       logAmount   0.000953     none      0.013622  1.984242e-11        1
+balanceDeltaOrig   0.008264     none      0.036269  1.992662e-78        1
+balanceDeltaDest   0.023657     none      0.036909  3.331816e-81        1
+   origZeroedOut   0.000000     none      0.041153 7.381492e-101        1
+  isMerchantDest   0.000000     none      0.002140  9.129204e-01        0
+    type_CASH_IN   0.000000     none      0.013998  4.815885e-12        1
+   type_CASH_OUT   0.000000     none      0.032967  7.184132e-65        1
+      type_DEBIT   0.000000     none      0.001800  9.795725e-01        0
+    type_PAYMENT   0.000000     none      0.002140  9.129204e-01        0
+   type_TRANSFER   0.000000     none      0.015030  8.073695e-14        1
+   txnVelocity1h   0.000000     none      0.000040  1.000000e+00        0
+  txnVelocity24h   0.000000     none      0.000210  1.000000e+00        0
 
 Features with significant PSI drift: 0
 Retrain triggered: False (reason: None)
+============================================================
 
-real    0m8.579s
+real    0m25.139s
 ```
 
 Two things worth noting about this result. First, **PSI reports no drift
-on every feature** (all `< 0.10`), which is the expected outcome here:
-the reference window is a 200,000-row random sample drawn from the same
-full training set that the "current" step-600–744 window is also a
-subset of, so both windows are drawn from the same underlying
-distribution — this run is a same-population sanity check, not a test
-against genuinely different data. Second, **KS flags several features as
-significant despite near-zero PSI** (e.g. `origZeroedOut`,
-`balanceDeltaDest`), which is not a contradiction — it is exactly the
-behavior described in
+on any feature** (all `< 0.10`), even though the current window is
+genuinely out-of-time. The feature distributions in PaySim's late steps
+are close to those of the early steps, which is consistent with the
+held-out evaluation in [07-evaluation-metrics.md](07-evaluation-metrics.md)
+showing no drop in ROC-AUC. (Run 1's check, where the reference sample and
+the current window both came from the same full training set, gave almost
+identical values.) Second, **KS flags several features as significant
+despite near-zero PSI** (e.g. `origZeroedOut`, `balanceDeltaDest`), which
+is not a contradiction — it is exactly the behavior described in
 [02-dataset-and-eda.md](02-dataset-and-eda.md)/Document 1 Section 6.2: KS
 is far more sensitive than decile-bucketed PSI and will flag statistically
 significant differences at multi-million-row sample sizes even when the
@@ -526,13 +536,17 @@ retraining trigger (Section 6.3 above) is keyed on PSI's `significant`
 band and not on the KS p-value alone — using KS as the sole trigger at
 this scale would fire constantly on noise.
 
-### Note on the baseline PR-AUC comparison
+### Known limitation: the PR-AUC trigger never fires
 
-`check_and_retrain()` compares the latest model's PR-AUC against itself
-as the baseline on the very first run (there is no earlier deployed
-version yet), so the performance-drop trigger is naturally inert until a
-second evaluated model exists. This is intentional — it prevents a
-false-positive retrain on the very first drift check.
+`check_and_retrain()` passes the latest run's stored `pr_auc` as **both**
+the current and the baseline value, so the PR-AUC drop it computes is
+always 0 and the performance half of the dual trigger never fires,
+regardless of how many models have been evaluated. Only the PSI half is
+active. Now that `models/evaluate.py` produces held-out metrics, the fix is
+to compute `current_pr_auc` by scoring the current window with the
+deployed model and comparing it with the deployed run's held-out
+`pr_auc` (taking into account that PR-AUC moves with the fraud base rate;
+see [07-evaluation-metrics.md](07-evaluation-metrics.md#generalization-check-overfitting)).
 
 ---
 [← 07 — Evaluation Metrics](07-evaluation-metrics.md) | [Index](README.md) | Next: [09 — Dashboard →](09-dashboard.md)

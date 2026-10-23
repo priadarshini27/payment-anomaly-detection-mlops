@@ -210,16 +210,19 @@ def build():
             ("Feature Eng.", "preprocessing/feature_engineering.py",
              "Balance-delta residuals, log-amount, one-hot type, velocity features."),
             ("Modeling", "models/train.py",
-             "Fits sklearn IsolationForest, persists model + scaler via joblib."),
+             "Fits sklearn IsolationForest on the earliest 80% of rows by step (time-based "
+             "split), persists model + scaler via joblib."),
             ("Scoring", "models/predict.py",
              "Scores transactions, bulk-writes anomaly_score/is_anomaly back to SQLite."),
             ("Evaluation", "models/evaluate.py",
-             "PR-AUC, ROC-AUC, precision@k/recall@k, confusion matrix by type."),
+             "PR-AUC, ROC-AUC, precision@k/recall@k, confusion matrix by type on held-out "
+             "rows; train-vs-held-out overfitting check."),
             ("Drift", "drift/psi.py, drift/ks_test.py,\ndrift/retrain.py",
              "PSI + KS per feature against a fixed reference window; retraining trigger."),
             ("Dashboard", "dashboard/app.py",
              "Streamlit app, six views, backed by live SQLite queries."),
-            ("Tests", "tests/", "24 pytest cases covering cleaning, feature engineering, drift."),
+            ("Tests", "tests/", "35 pytest cases covering cleaning, feature engineering, drift, "
+             "and the train/test split."),
         ],
     )
 
@@ -256,42 +259,73 @@ def build():
     )
 
     # ---- 6. Measured results ---------------------------------------------
-    add_heading(doc, "6. Measured Results (Full 6,362,604-Row Run)", level=1)
+    add_heading(doc, "6. Measured Results (Full 6,362,604-Row Dataset)", level=1)
     add_body(
         doc,
         "Every figure below is from an actual run against the complete dataset, recorded in "
         "docs/05 through docs/08 alongside full command output."
     )
+    add_body(doc, "Train/test split:", bold=True)
     add_table(
         doc,
-        ["Stage", "Result", "Time"],
+        ["Partition", "Steps", "Rows", "Fraud", "Base fraud rate"],
         [
-            ("Velocity feature backfill", "6,362,604 rows updated", "4m 25s"),
-            ("Model training", "run_id = 1, 200 estimators", "2m 58s"),
-            ("Evaluation", "PR-AUC 0.0114, ROC-AUC 0.8540", "6m 9s"),
-            ("Anomaly scoring", "6,362,604 rows scored, 8,249 flagged", "7m 23s"),
-            ("Drift check", "12 features checked, 0 significant PSI drift", "8.6s"),
+            ("Training", "1-355", "5,113,881", "3,960", "0.077%"),
+            ("Held-out", "356-743", "1,248,723", "4,237", "0.339%"),
         ],
     )
     add_body(
         doc,
-        "A PR-AUC of 0.0114 against a 0.129% base fraud rate represents roughly an 8.8x "
-        "enrichment over random guessing in the model's highest-scored transactions -- the "
-        "absolute value looks small in isolation but is the expected order of magnitude under "
-        "this severity of class imbalance. ROC-AUC of 0.854 confirms solid overall rank-"
-        "ordering. The confusion matrix by type concentrates almost all errors in TRANSFER "
-        "(26,793 false positives, 814 true positives) and CASH_OUT (291 false positives, 3 "
-        "true positives) -- exactly the two types where PaySim fraud actually occurs, rather "
-        "than spreading across CASH_IN / DEBIT / PAYMENT, which would have signaled a "
-        "mis-specified feature."
+        "The model is fit only on the earliest 80% of rows by step. Later rows never touch the "
+        "scaler, the model or the drift reference window, so evaluation measures performance on "
+        "transactions from after the training period. The split is by time, not at random, "
+        "because a deployed model only ever scores later transactions."
+    )
+    add_body(doc, "Pipeline stages:", bold=True)
+    add_table(
+        doc,
+        ["Stage", "Result", "Time"],
+        [
+            ("Velocity feature backfill", "6,362,604 rows updated", "4m 19s - 4m 25s"),
+            ("Model training (run 2)", "5,113,881 training rows, 200 estimators", "Not separately timed"),
+            ("Evaluation (run 2)", "Held-out PR-AUC 0.0280, ROC-AUC 0.8538", "Not separately timed"),
+            ("Anomaly scoring (run 1 model)", "6,362,604 rows scored, 8,249 flagged", "7m 23s"),
+            ("Drift check (run 2)", "12 features checked, 0 significant PSI drift", "25.1s"),
+        ],
+    )
+    add_body(doc, "Overfitting check (training window vs held-out window):", bold=True)
+    add_table(
+        doc,
+        ["Metric", "Training (steps 1-355)", "Held-out (steps 356-743)"],
+        [
+            ("ROC-AUC", "0.8508", "0.8538 (gap -0.003)"),
+            ("PR-AUC", "0.0063", "0.0280"),
+            ("PR-AUC lift over base rate", "8.18x", "8.24x"),
+            ("Precision@0.5% / Recall@0.5%", "-", "0.0394 / 0.0581"),
+        ],
     )
     add_body(
         doc,
-        "Note: this evaluation run scored the model against the same full dataset it was "
-        "trained on (no held-out nameOrig or step-range split), consistent with using isFraud "
-        "only for offline evaluation rather than for train/test partitioning of an unsupervised "
-        "model. These numbers describe in-sample discriminative power; a rigorous production "
-        "benchmark would score a genuinely unseen window instead.",
+        "The model does not overfit: held-out ROC-AUC matches the training window, and lift is "
+        "almost identical. Raw PR-AUC is higher on the held-out rows only because their fraud "
+        "rate is about 4.4x higher (PaySim's transaction volume collapses in the late steps "
+        "while fraud keeps arriving), so evaluate.py flags overfitting on the ROC-AUC gap "
+        "(above 0.05), which does not depend on the base rate."
+    )
+    add_body(
+        doc,
+        "The real limitation is missing signal, not memorization. All 246 frauds caught in the "
+        "held-out window are TRANSFERs; none of the 2,112 CASH_OUT frauds are flagged at the "
+        "top-0.5% threshold. Errors still concentrate in TRANSFER and CASH_OUT, the two types "
+        "where PaySim fraud occurs, rather than spreading across CASH_IN / DEBIT / PAYMENT, "
+        "which would have signaled a mis-specified feature."
+    )
+    add_body(
+        doc,
+        "Note: run 1 (trained and evaluated on all 6,362,604 rows before the split existed) "
+        "scored PR-AUC 0.0114 and ROC-AUC 0.8540. Those numbers are in-sample; its ROC-AUC "
+        "matches run 2's held-out ROC-AUC, confirming they were not inflated, but its PR-AUC is "
+        "not comparable with run 2's because the fraud rate differs.",
         italic=True,
         size=10,
     )
@@ -351,10 +385,12 @@ def build():
         "The Kolmogorov-Smirnov test complements PSI by testing the maximum distance between "
         "empirical CDFs and returning a p-value rather than a fixed-bucket approximation. "
         "Retraining triggers automatically when three or more features simultaneously exceed "
-        "PSI 0.25, or PR-AUC on the rolling evaluation window drops more than 15% relative to "
-        "the last deployed model. On the measured run (reference window vs. step 600-744), all "
-        "12 features showed zero significant PSI drift, so no retrain fired -- expected, since "
-        "both windows are drawn from the same underlying training-set population. KS flagged "
+        "PSI 0.25, or PR-AUC drops more than 15% relative to the last deployed model (as "
+        "implemented, the PR-AUC half compares the latest run with itself and never fires; see "
+        "docs/08). On the measured run (run 2's reference window, sampled from training steps "
+        "1-355, vs. held-out steps 600-744), all 12 features showed zero significant PSI drift, "
+        "so no retrain fired: PaySim's late-step feature distributions stay close to the early "
+        "ones, consistent with the unchanged held-out ROC-AUC. KS flagged "
         "several features as statistically significant despite near-zero PSI, which is not a "
         "contradiction: KS is far more sensitive at multi-million-row sample sizes and will "
         "flag negligible practical shifts as significant, which is exactly why the retraining "
@@ -370,7 +406,8 @@ def build():
             ("Transaction Overview", "Volume and value trends by step and type; live SQL aggregates."),
             ("Fraud Analytics", "Flagged-transaction breakdown by type, amount band, and time."),
             ("Transaction Analysis", "Drill-down into individual transaction feature values and anomaly score."),
-            ("Model Performance", "PR-AUC / ROC-AUC trend across model_runs versions; confusion matrix."),
+            ("Model Performance", "PR-AUC / ROC-AUC trend across model_runs versions; confusion "
+             "matrix. Run 1's points are in-sample, later runs are held-out."),
             ("Drift Monitoring", "Per-feature PSI and KS p-value, with threshold bands overlaid."),
             ("System Health", "Pipeline run status, row counts, last retrain trigger reason."),
         ],
@@ -399,7 +436,7 @@ def build():
             ("Drift Detection", "PSI (custom), KS Test (SciPy)"),
             ("Dashboard / Visualization", "Streamlit, Plotly"),
             ("Model Persistence", "joblib"),
-            ("Testing", "pytest (24 tests)"),
+            ("Testing", "pytest (35 tests)"),
         ],
     )
 
@@ -407,11 +444,13 @@ def build():
     add_heading(doc, "11. End-to-End Verification Summary", level=1)
     add_bullets(doc, [
         "6,362,604 / 6,362,604 rows populated with txnVelocity1h/24h -- zero NULLs.",
-        "6,362,604 / 6,362,604 rows populated with anomaly_score/is_anomaly -- zero NULLs.",
-        "model_runs: 1 row, is_deployed = 1, PR-AUC/ROC-AUC/precision@k/recall@k all populated.",
-        "drift_metrics: 12 rows (one per model feature) for the evaluated run.",
-        "retrain_log: 1 row, correctly logging no trigger on the reference-window comparison.",
-        "pytest: 24/24 passing.",
+        "6,362,604 / 6,362,604 rows populated with anomaly_score/is_anomaly -- zero NULLs "
+        "(scored with the run 1 model).",
+        "model_runs: 2 rows; run 2 (train_step_end = 355) is deployed, with held-out and "
+        "training-window metrics populated.",
+        "drift_metrics: 12 rows (one per model feature) for each of runs 1 and 2.",
+        "retrain_log: 2 rows, each correctly logging no trigger.",
+        "pytest: 35/35 passing.",
         "Dashboard: imports cleanly, all query functions verified, headless launch returns HTTP 200.",
     ])
     add_body(

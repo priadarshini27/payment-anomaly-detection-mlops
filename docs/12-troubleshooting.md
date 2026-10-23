@@ -72,6 +72,29 @@ sqlite3 database/database.db "SELECT COUNT(*) FROM transactions;"
 No model has been trained yet. Run `python models/train.py` first — every
 successful call inserts exactly one row into `model_runs`.
 
+## `WARNING: this run has no train_step_end` from `models/evaluate.py`
+
+The model being evaluated was trained before the time-based train/test
+split existed (run 1), so there are no held-out rows and the metrics are
+in-sample. Retrain with `python models/train.py` and evaluate the new run.
+
+## `RuntimeError: Held-out window (step > N) has no rows or no fraud to evaluate.`
+
+Every row in `transactions` is at or before the model's `train_step_end`,
+or none of the later rows are fraud, so held-out PR-AUC/ROC-AUC can't be
+computed. This happens on a partial or sampled load where the late steps
+are missing. Load the full dataset, or retrain with a smaller
+`--train-fraction` so more steps are held out.
+
+## `WARNING: held-out performance is materially worse than in-sample`
+
+Training-window ROC-AUC exceeds held-out ROC-AUC by more than 0.05, so the
+model is fitting its training period better than new data. See the
+generalization check in
+[07-evaluation-metrics.md](07-evaluation-metrics.md#generalization-check-overfitting).
+Check `drift/retrain.py` output for features that shifted between the two
+periods before changing hyperparameters.
+
 ## Dtype mismatches / `df['type']` behaving unexpectedly
 
 `type` is loaded as a pandas `category` dtype
